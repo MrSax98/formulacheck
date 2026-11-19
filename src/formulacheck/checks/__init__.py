@@ -76,6 +76,8 @@ def _load_spec(raw: str) -> dict[str, Any]:
         spec = yaml.load(raw, Loader=_NoAliasLoader)  # a SafeLoader subclass: no Python objects
     except yaml.YAMLError as exc:
         raise SpecError(f"invalid YAML: {exc}") from exc
+    except RecursionError as exc:
+        raise SpecError("invalid YAML: nested too deeply") from exc
     if not isinstance(spec, dict):
         raise SpecError("a check block must be a YAML mapping (key: value lines)")
     return {str(k): v for k, v in spec.items()}

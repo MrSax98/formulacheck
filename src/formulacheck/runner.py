@@ -8,7 +8,7 @@ from pathlib import Path
 from . import citations
 from .checks import run_block
 from .checks.isolate import isolation_needed, run_block_isolated
-from .model import CitationStatus, FileReport, Status
+from .model import CitationResult, CitationStatus, FileReport, Status
 from .parser import parse_file
 
 MARKDOWN_SUFFIXES = {".md", ".markdown"}
@@ -49,15 +49,30 @@ def analyze_file(path: Path, lookup: citations.Lookup | None) -> FileReport:
     cites = []
     if lookup is not None:
         refs = citations.extract_references(doc.text)[: citations.MAX_REFERENCES]
-        cites = [citations.verify(doc.path, ref, lookup) for ref in refs]
+        cites = [_verify_safely(doc.path, ref, lookup) for ref in refs]
     return FileReport(doc.path, doc.equations, results, cites)
 
 
 def analyze_bib(path: Path, lookup: citations.Lookup) -> FileReport:
     """Verify the entries of a BibTeX file."""
     refs = citations.parse_bibtex(path.read_text(encoding="utf-8"))[: citations.MAX_REFERENCES]
-    cites = [citations.verify(str(path), ref, lookup) for ref in refs]
+    cites = [_verify_safely(str(path), ref, lookup) for ref in refs]
     return FileReport(str(path), [], [], cites)
+
+
+def _verify_safely(path: str, ref: citations.Reference, lookup: citations.Lookup) -> CitationResult:
+    """One odd reference or API answer must not stop the whole run."""
+    try:
+        return citations.verify(path, ref, lookup)
+    except Exception as exc:
+        return CitationResult(
+            path,
+            ref.line,
+            ref.text[:140],
+            CitationStatus.UNCHECKED,
+            f"internal error while checking: {type(exc).__name__}: {exc}",
+            ref.identifier[:200],
+        )
 
 
 @dataclass

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 import signal
 import sys
 import threading
@@ -84,8 +85,13 @@ def get_str(spec: dict[str, Any], key: str) -> str:
     return value
 
 
+_NUMBER_RE = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
+
+
 def get_number(spec: dict[str, Any], key: str, default: float, low: float, high: float) -> float:
     value = spec.get(key, default)
+    if isinstance(value, str) and _NUMBER_RE.match(value.strip()):
+        value = float(value)  # YAML 1.1 reads `1e-6` (no decimal point) as a string
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise SpecError(f"'{key}' must be a number")
     if not low <= value <= high:

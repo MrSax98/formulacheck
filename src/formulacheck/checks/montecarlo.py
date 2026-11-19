@@ -1,9 +1,14 @@
 """Monte Carlo checks: simulate random variables and test a claim statistically.
 
-The claim ``lhs == rhs`` is evaluated on K independent batches. The batch-to-batch
-spread of ``lhs - rhs`` gives a standard error for any estimator (mean, variance,
-probability, correlation, ...), so no per-statistic formula is needed. The check passes
-when the mean difference is within ``tol`` standard errors of zero.
+The claim ``lhs == rhs`` is estimated on the whole sample (point estimate). Its
+uncertainty comes from re-evaluating the claim, including any statistic defined in
+``setup``, on K independent batches: the spread of the batch values gives a standard
+error for any estimator (mean, variance, quantile, correlation, ...) without
+per-statistic formulas (the "batch means" method). The check passes when the
+whole-sample difference is within ``tol`` standard errors of zero.
+
+If the batches show no variation at all (rare events, or quantities that do not depend on
+the random variables) the uncertainty cannot be measured and the result is inconclusive.
 
 A pass is statistical evidence, not a proof. The seed is fixed, so results are repeatable.
 """
@@ -36,6 +41,8 @@ MIN_N = 5_000
 MAX_N = 5_000_000
 DEFAULT_N = 200_000
 DEFAULT_SIGMA = 4.0
+# Memory budget: samples kept at once (n x setup entries, plus temporaries). 30M floats = 240 MB.
+MAX_VALUES = 30_000_000
 _TOL_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*sigma\s*$", re.IGNORECASE)
 
 
@@ -127,14 +134,17 @@ def _stat_funcs() -> dict[str, Callable[..., Any]]:
     def mean(a: Any) -> Any:
         return np.mean(a)
 
+    # Population formulas (ddof=0) on the sample: identities such as
+    # variance(X) == mean(X**2) - mean(X)**2 then hold exactly, and the bias (a factor
+    # 1 - 1/n) is negligible at simulation sizes.
     def variance(a: Any) -> Any:
-        return np.var(a, ddof=1) if np.size(a) > 1 else 0.0
+        return np.var(a)
 
     def std(a: Any) -> Any:
-        return np.std(a, ddof=1) if np.size(a) > 1 else 0.0
+        return np.std(a)
 
     def cov(a: Any, b: Any) -> Any:
-        return np.cov(a, b, ddof=1)[0, 1]
+        return np.mean((a - np.mean(a)) * (b - np.mean(b)))
 
     def corr(a: Any, b: Any) -> Any:
         return np.corrcoef(a, b)[0, 1]
@@ -218,6 +228,13 @@ def run_monte_carlo(spec: dict[str, Any]) -> Outcome:
 
     per_batch = n_total // BATCHES
     n = per_batch * BATCHES
+    # Every setup entry may hold n values; the claim adds a few temporaries.
+    if n * (len(setup) + 3) > MAX_VALUES:
+        most = MAX_VALUES // (len(setup) + 3)
+        raise SpecError(
+            f"memory budget exceeded ({len(setup)} setup entries x n={n}); "
+            f"use n <= {most} or fewer entries"
+        )
     rng = np.random.default_rng(seed)
     dists = _distributions(rng, n)
     funcs = _stat_funcs()
@@ -225,7 +242,11 @@ def run_monte_carlo(spec: dict[str, Any]) -> Outcome:
     try:
         # Non-finite results (log(0), 1/0) are reported as errors by _side; silence numpy.
         with time_limit(timeout), np.errstate(all="ignore"):
-            env = _build_env(setup, dists, funcs)
+            env, derived = _build_env(setup, dists, funcs)
+            lhs_all = _side(lhs_node, env, funcs)
+            rhs_all = _side(rhs_node, env, funcs)
+            if not any(isinstance(v, np.ndarray) for v in env.values()):
+                return _exact_verdict(lhs_all, rhs_all)
             diffs = np.empty(BATCHES)
             for b in range(BATCHES):
                 sl = slice(b * per_batch, (b + 1) * per_batch)
@@ -233,33 +254,62 @@ def run_monte_carlo(spec: dict[str, Any]) -> Outcome:
                     k: (v[sl] if isinstance(v, np.ndarray) and v.shape == (n,) else v)
                     for k, v in env.items()
                 }
+                # Statistics defined in setup (e.g. s2: variance(X)) are recomputed per
+                # batch, so their sampling error is part of the standard error.
+                for name, node in derived:
+                    batch_env[name] = evaluate(
+                        node, batch_env, funcs, allow_compare=True, allow_bitwise=True
+                    )
                 diffs[b] = _side(lhs_node, batch_env, funcs) - _side(rhs_node, batch_env, funcs)
-            lhs_all = _side(lhs_node, env, funcs)
-            rhs_all = _side(rhs_node, env, funcs)
     except CheckTimeout:
         return Outcome(Status.ERROR, f"timed out after {timeout:g}s")
+    return _verdict(lhs_all, rhs_all, diffs, n, sigma)
 
-    mean_diff = float(np.mean(diffs))
-    se = float(np.std(diffs, ddof=1) / math.sqrt(BATCHES))
-    details: dict[str, Any] = {
-        "lhs": lhs_all,
-        "rhs": rhs_all,
-        "n": n,
-        "se": se,
-        "resolution": sigma * se,
-    }
-    if se < 1e-12:
-        ok = abs(mean_diff) < 1e-9
-        z = 0.0 if ok else math.inf
-    else:
-        z = mean_diff / se
-        ok = abs(z) <= sigma
-    details["z"] = z if math.isfinite(z) else None  # keep the JSON report valid
+
+def _exact_verdict(lhs: float, rhs: float) -> Outcome:
+    """Nothing random in setup: compare the two numbers directly."""
+    details: dict[str, Any] = {"lhs": lhs, "rhs": rhs, "z": None}
+    if abs(lhs - rhs) <= 1e-9 * max(abs(lhs), abs(rhs)):
+        return Outcome(Status.PASS, f"no random variables; lhs = rhs = {lhs:.10g}", details)
+    return Outcome(Status.FAIL, f"no random variables; lhs = {lhs:.10g}, rhs = {rhs:.10g}", details)
+
+
+def _verdict(lhs: float, rhs: float, diffs: Any, n: int, sigma: float) -> Outcome:
+    """Compare the whole-sample difference with its batch-means standard error."""
+    diff = lhs - rhs
+    with np.errstate(all="ignore"):  # overflow is detected just below
+        se = float(np.std(diffs, ddof=1) / math.sqrt(BATCHES))
+        worst = float(np.max(np.abs(diffs)))
+    if not all(math.isfinite(v) for v in (diff, se, worst)):
+        return Outcome(Status.ERROR, "values too large to simulate reliably (overflow)")
+    details: dict[str, Any] = {"lhs": lhs, "rhs": rhs, "n": n, "se": se}
+    scale = max(abs(lhs), abs(rhs))
+    rounding = 1e-9 * scale
+    if scale > 0 and abs(diff) <= rounding and worst <= rounding:
+        details["z"] = 0.0
+        return Outcome(
+            Status.PASS,
+            f"lhs~{lhs:.6g}, rhs~{rhs:.6g}: equal up to rounding on the whole sample and on "
+            f"every batch (an identity on the simulated data, n={n})",
+            details,
+        )
+    if se <= 1e-15 * scale or se == 0:
+        details["z"] = None
+        return Outcome(
+            Status.INCONCLUSIVE,
+            f"lhs~{lhs:.6g}, rhs~{rhs:.6g}, but the value did not vary between batches, so "
+            f"its uncertainty cannot be measured (a rare event, or a quantity that does not "
+            f"depend on the random variables); try a larger n or a symbolic check",
+            details,
+        )
+    z = diff / se
+    details["z"] = z
+    details["resolution"] = sigma * se
     summary = (
-        f"lhs~{lhs_all:.6g}, rhs~{rhs_all:.6g}, z={z:.2f} (limit {sigma:g}, n={n}); "
+        f"lhs~{lhs:.6g}, rhs~{rhs:.6g}, z={z:.2f} (limit {sigma:g}, n={n}); "
         f"differences below ~{sigma * se:.2g} cannot be detected"
     )
-    if ok:
+    if abs(z) <= sigma:
         return Outcome(Status.PASS, "statistically consistent: " + summary, details)
     return Outcome(Status.FAIL, "statistically inconsistent: " + summary, details)
 
@@ -268,9 +318,14 @@ def _build_env(
     setup: dict[str, Any],
     dists: dict[str, Callable[..., Any]],
     funcs: dict[str, Callable[..., Any]],
-) -> dict[str, Any]:
-    """Resolve ``setup`` in dependency order (so ``X: bernoulli(p)`` may precede ``p: 0.3``)."""
+) -> tuple[dict[str, Any], list[tuple[str, ast.expr]]]:
+    """Resolve ``setup`` in dependency order (so ``X: bernoulli(p)`` may precede ``p: 0.3``).
+
+    Returns the whole-sample environment and the derived (non-random) entries, in
+    evaluation order, so they can be recomputed on each batch.
+    """
     env: dict[str, Any] = {"pi": math.pi}
+    derived: list[tuple[str, ast.expr]] = []
     pending: dict[str, ast.expr] = {}
     for name, value in setup.items():
         if not isinstance(name, str) or not name.isidentifier() or name == "pi":
@@ -308,7 +363,8 @@ def _build_env(
                             f"{exc}; declare each random variable on its own line in 'setup'"
                         ) from exc
                     raise
-    return env
+                derived.append((name, node))
+    return env, derived
 
 
 def _side(node: ast.expr, env: dict[str, Any], funcs: dict[str, Callable[..., Any]]) -> float:

@@ -32,6 +32,15 @@ def _paint(text: str, code: str, color: bool) -> str:
     return f"\033[{code}m{text}\033[0m" if color else text
 
 
+def _safe(text: str) -> str:
+    """Show control characters (escape sequences, carriage returns) instead of obeying them.
+
+    Ids, messages and paths come from the notes and from web APIs: they must not be able
+    to rewrite the terminal (e.g. turn a FAIL into a PASS on screen).
+    """
+    return "".join(ch if ch.isprintable() else ascii(ch)[1:-1] for ch in text)
+
+
 def render_terminal(reports: list[FileReport], summary: Summary, *, color: bool = False) -> str:
     """Plain-text summary, one line per check or citation."""
     out: list[str] = []
@@ -39,17 +48,18 @@ def render_terminal(reports: list[FileReport], summary: Summary, *, color: bool 
         rows: list[tuple[int, str]] = []
         for r in report.results:
             tag = _paint(f"{_CHECK_LABEL[r.status]:<12}", _CHECK_COLOR[r.status], color)
-            rows.append((r.line, f"{tag} {r.check_id} ({r.kind}): {r.message}"))
+            rows.append(
+                (r.line, f"{tag} {_safe(r.check_id)} ({_safe(r.kind)}): {_safe(r.message)}")
+            )
         for c in report.citations:
             tag = _paint(f"{c.status.value.upper():<12}", _CITE_COLOR[c.status], color)
-            rows.append((c.line, f"{tag} citation: {c.message}"))
+            rows.append((c.line, f"{tag} citation: {_safe(c.message)}"))
         for eq in report.uncovered:
             rows.append((eq.line, f"{'UNCOVERED':<12} equation has no check"))
+        path = _safe(report.path)
         if not rows:
-            out.append(f"{report.path}: nothing to check")
-        out.extend(
-            f"{report.path}:{line}  {text}" for line, text in sorted(rows, key=lambda r: r[0])
-        )
+            out.append(f"{path}: nothing to check")
+        out.extend(f"{path}:{line}  {text}" for line, text in sorted(rows, key=lambda r: r[0]))
     checks = ", ".join(f"{n} {k}" for k, n in sorted(summary.checks.items())) or "none"
     cites = ", ".join(f"{n} {k}" for k, n in sorted(summary.citations.items())) or "none"
     out.append("")

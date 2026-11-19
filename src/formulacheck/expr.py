@@ -80,9 +80,14 @@ def evaluate(
     *,
     allow_compare: bool = False,
     allow_bitwise: bool = False,
+    number: Callable[[int | float], Any] | None = None,
 ) -> Any:
-    """Evaluate a validated AST node against *env* (variables) and *funcs* (calls)."""
-    return _Evaluator(env, funcs, allow_compare, allow_bitwise).visit(node)
+    """Evaluate a validated AST node against *env* (variables) and *funcs* (calls).
+
+    *number* converts numeric literals (e.g. to exact sympy rationals, so that ``1/2``
+    stays one half instead of becoming the float 0.5).
+    """
+    return _Evaluator(env, funcs, allow_compare, allow_bitwise, number).visit(node)
 
 
 class _Evaluator:
@@ -92,17 +97,19 @@ class _Evaluator:
         funcs: Mapping[str, Callable[..., Any]],
         allow_compare: bool,
         allow_bitwise: bool,
+        number: Callable[[int | float], Any] | None,
     ) -> None:
         self.env = env
         self.funcs = funcs
         self.allow_compare = allow_compare
         self.allow_bitwise = allow_bitwise
+        self.number = number
 
     def visit(self, node: ast.AST) -> Any:
         if isinstance(node, ast.Constant):
             if isinstance(node.value, bool) or not isinstance(node.value, int | float):
                 raise ExprError(f"only numbers are allowed as literals, got {node.value!r}")
-            return node.value
+            return self.number(node.value) if self.number else node.value
         if isinstance(node, ast.Name):
             if node.id in self.env:
                 return self.env[node.id]
@@ -178,8 +185,11 @@ def _check_power(base: Any, exponent: Any) -> None:
     if abs(exp_val) > MAX_EXPONENT:
         raise ExprError(f"exponent {exp_val:g} is too large (max {MAX_EXPONENT})")
     try:
-        bits = int(abs(float(base))).bit_length()
-    except (TypeError, ValueError, OverflowError):
-        return
+        # int() keeps huge integers exact (float() would overflow and skip the check).
+        bits = abs(int(base)).bit_length()
+    except (TypeError, ValueError):
+        return  # symbolic or array base
+    except OverflowError:
+        return  # base is infinite: the result is inf, no big integer is built
     if bits * abs(exp_val) > MAX_POW_BITS:
         raise ExprError("power would produce an enormous number")

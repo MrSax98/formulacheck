@@ -188,3 +188,6 @@ dopo l'approvazione di questa specifica e con le integrazioni GitHub effettivame
 | — | Loader YAML senza alias, blocchi di al massimo 20.000 caratteri | Emerso dalla revisione: gli alias YAML possono generare strutture enormi |
 | — | Le cartelle nascoste e di dipendenze (`.venv`, `node_modules`, ...) non vengono analizzate | `formulacheck .` deve funzionare anche in un progetto reale |
 | §11 pubblicazione | Aggiunti GitHub Action, hook pre-commit, `python -m formulacheck`, workflow di rilascio su PyPI con trusted publishing, CI anche su Windows | Richiesta: facile da usare e da trovare per chiunque |
+| §8 Monte Carlo | Stima puntuale sull'intero campione, errore standard dai 50 lotti (batch means), statistiche di `setup` ricalcolate per lotto, `ddof=0`, `inconclusive` se i lotti non variano | Revisione indipendente: la media delle stime per lotto era distorta (es. quantili estremi) |
+| §6 citazioni | `verified` solo se autore, anno e titolo coincidono (titolo confrontato in modo simmetrico); DataCite come terza fonte; `not-found` solo se tutte le fonti rispondono | Revisione indipendente: falsi `verified` e falsi `not-found` |
+| §5 funzioni | `Limit` bilaterale, più `LimitLeft`/`LimitRight`; numeri esatti (1/2 = un mezzo) | Revisione indipendente: `Limit` era unilaterale (falsi `pass`) |

@@ -19,7 +19,7 @@ from typing import Any
 
 from ..model import CheckBlock, CheckResult, Status
 from . import _load_spec, run_block
-from .base import DEFAULT_TIMEOUT, MAX_TIMEOUT, SpecError
+from .base import DEFAULT_TIMEOUT, MAX_TIMEOUT, SpecError, get_number
 
 STARTUP_GRACE = 15.0  # seconds allowed for the worker to start and import sympy/numpy
 
@@ -61,12 +61,12 @@ def _peek(raw: str) -> tuple[str | None, str, float]:
     """Read id, kind and timeout without running anything (for duplicate and timeout handling)."""
     try:
         spec = _load_spec(raw)
-    except SpecError:
+    except Exception:  # anything odd is reported by the worker; here just use defaults
         return None, "?", DEFAULT_TIMEOUT
-    timeout = spec.get("timeout", DEFAULT_TIMEOUT)
-    if isinstance(timeout, bool) or not isinstance(timeout, int | float):
+    try:
+        timeout = get_number(spec, "timeout", DEFAULT_TIMEOUT, 1.0, MAX_TIMEOUT)
+    except SpecError:
         timeout = DEFAULT_TIMEOUT
-    timeout = min(max(float(timeout), 1.0), MAX_TIMEOUT)
     check_id = str(spec["id"]) if "id" in spec else None
     return check_id, str(spec.get("kind", "?")), timeout
 

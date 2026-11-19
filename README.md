@@ -13,8 +13,8 @@ references.
 
 ```
 $ formulacheck examples/statistics_notes.md
-examples/statistics_notes.md:17  PASS         bernoulli-variance (monte-carlo): statistically consistent: lhs~0.210075, rhs~0.21, z=0.20 ...
-examples/statistics_notes.md:36  FAIL         exponential-variance-wrong (monte-carlo): statistically inconsistent: lhs~0.246406, rhs~0.5, z=-126.12 ...
+examples/statistics_notes.md:17  PASS         bernoulli-variance (monte-carlo): statistically consistent: lhs~0.210074, rhs~0.21, z=0.19 ...
+examples/statistics_notes.md:36  FAIL         exponential-variance-wrong (monte-carlo): statistically inconsistent: lhs~0.246405, rhs~0.5, z=-126.15 ...
 examples/statistics_notes.md:52  PASS         square-of-sum (symbolic): proved: simplify(lhs - rhs) == 0
 examples/statistics_notes.md:66  FAIL         square-of-sum-wrong (symbolic): lhs != rhs at a=2.06653, b=1.54773: lhs=13.06285747, rhs=6.666007889
 examples/statistics_notes.md:80  PASS         gauss-sum (symbolic): proved: simplify(lhs - rhs) == 0
@@ -22,7 +22,7 @@ examples/statistics_notes.md:97  INCONCLUSIVE tan-double-angle (symbolic): numer
 examples/statistics_notes.md:109  UNCOVERED    equation has no check
 examples/statistics_notes.md:117  VERIFIED     citation: matches Efron (1979), "Bootstrap Methods: Another Look at the Jackknife", ...
 examples/statistics_notes.md:118  VERIFIED     citation: matches Tibshirani (1996), "Regression Shrinkage and Selection Via the Lasso", ...
-examples/statistics_notes.md:119  NOT-FOUND    citation: 10.9999/fake.12345 not found in Crossref or OpenAlex
+examples/statistics_notes.md:119  NOT-FOUND    citation: 10.9999/fake.12345 not found in Crossref, OpenAlex or DataCite
 
 checks: 2 fail, 1 inconclusive, 3 pass
 citations: 1 not-found, 2 verified
@@ -119,23 +119,25 @@ Read them together.
 
 ## Citations
 
-References under a `References` / `Bibliography` / `Riferimenti` / `Bibliografia` heading
-(one entry per line), DOIs and `arXiv:` ids anywhere in the text, and an optional
-`--bib refs.bib` are looked up in [Crossref](https://www.crossref.org) and
-[OpenAlex](https://openalex.org):
+Entries under a `References`, `Bibliography`, `Riferimenti` or `Bibliografia` heading (one
+entry per line, ideally `Author, A. (Year). Title. Journal.`), and an optional
+`--bib refs.bib`, are looked up in [Crossref](https://www.crossref.org),
+[OpenAlex](https://openalex.org) and, for arXiv and repository DOIs,
+[DataCite](https://datacite.org):
 
 | verdict | meaning |
 |---|---|
-| `verified` | the work exists and its author, year and title agree with your entry |
-| `mismatch` | a work exists but something disagrees (wrong year, other author, different title) |
-| `not-found` | no such work |
-| `unparseable` | the entry has too little text to identify a work |
-| `unchecked` | offline or network error; never reported as `not-found` |
+| `verified` | the work exists, and the first author, the year and the title all agree with your entry (an entry that is only a DOI is verified by existence) |
+| `mismatch` | a work exists but something disagrees (other author, wrong year, different title) |
+| `not-found` | every catalogue answered and none has such a work |
+| `unparseable` | the entry has too little text, or the DOI is malformed |
+| `unchecked` | offline, network error or rate limit; never reported as `not-found` |
 
-Lookups are cached (`~/.cache/formulacheck`, or `--cache-dir` / `FORMULACHECK_CACHE_DIR`), and
-`--offline` uses the cache only. No email address is sent unless you set
-`FORMULACHECK_MAILTO` (Crossref's optional "polite pool" contact). A citation check does
-**not** tell you whether the source supports your claim.
+DOIs and `arXiv:` ids written elsewhere in the text are checked for existence only.
+Lookups are cached (`~/.cache/formulacheck`, or `--cache-dir` / `FORMULACHECK_CACHE_DIR`;
+"not found" answers are re-checked after a week), and `--offline` uses the cache only. No email
+address is sent unless you set `FORMULACHECK_MAILTO` (Crossref's optional "polite pool"
+contact). A citation check does **not** tell you whether the source supports your claim.
 
 ## Options and exit codes
 
@@ -175,10 +177,12 @@ repos:
 ## Limits
 
 * A Monte Carlo `pass` is statistical evidence, not a proof; the report states the smallest
-  difference the simulation could detect.
+  difference the simulation could detect, and very rare events end as `inconclusive`.
 * `symbolic` is limited by what sympy can prove; hard identities end as `inconclusive`.
 * Only formulas with a check block are verified; the rest are reported as not covered.
-* Books and lecture notes without a DOI may come back `not-found` or `unchecked`.
+* Books and lecture notes without a DOI may come back `not-found` or `unchecked`, and titles
+  that are heavily abbreviated in your entry may come back `mismatch` (the message shows the
+  title found, so you can judge).
 * Display equations are found when `$$` or `\[` starts the line.
 
 ## Contributing

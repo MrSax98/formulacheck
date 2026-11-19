@@ -19,6 +19,7 @@ import json
 import re
 import time
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,19 +32,34 @@ from .parser import code_fence_lines
 
 CROSSREF = "https://api.crossref.org/works"
 OPENALEX = "https://api.openalex.org/works"
+DATACITE = "https://api.datacite.org/dois"
 MAX_REFERENCES = 200
-TITLE_MATCH = 0.8
+MAX_DOI_LENGTH = 300
+NOT_FOUND_TTL = 7 * 24 * 3600  # re-check "not found" answers after a week
+TITLE_MATCH = 0.8  # share of the found title's words that must appear in the entry
 TITLE_CLOSE = 0.5
 
-_DOI_RE = re.compile(r"\b10\.\d{4,9}/[^\s<>\"'\)\]\},;]+", re.IGNORECASE)
+# A DOI runs until whitespace, a quote or a backtick; trailing punctuation and Markdown
+# are removed afterwards (see _clean_doi), keeping balanced parentheses such as
+# 10.1016/S0140-6736(20)30183-5.
+_DOI_RE = re.compile(r"\b10\.\d{4,9}/[^\s\"'`]+", re.IGNORECASE)
+_VALID_DOI_RE = re.compile(r"^10\.\d{4,9}/[^\s\x00-\x1f\x7f]+$")
 _ARXIV_RE = re.compile(r"\barxiv:\s*(\d{4}\.\d{4,5})(?:v\d+)?", re.IGNORECASE)
+# Only headings that are exactly a bibliography title start a reference section
+# ("## Fonti di errore" does not).
 _HEADING_RE = re.compile(
-    r"^(#{1,6})\s*(riferimenti|bibliografia|references|bibliography|fonti|sources)\b",
+    r"^(#{1,6})\s*(?:riferimenti(?:\s+bibliografici)?|bibliografia|references|bibliography"
+    r"|fonti(?:\s+bibliografiche)?|sources|works\s+cited|literature)\s*:?\s*$",
     re.IGNORECASE,
 )
 _ANY_HEADING_RE = re.compile(r"^(#{1,6})\s")
 _LIST_MARKER_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+|\[\d+\]\s*)")
 _YEAR_RE = re.compile(r"\b(1[5-9]\d\d|20\d\d)\b")
+# APA-like entries: "Author, A. (1979). Title of the work. Journal..."
+_TITLE_AFTER_YEAR_RE = re.compile(
+    r"\(\s*(?:1[5-9]\d\d|20\d\d)[a-z]?\s*\)\s*[.,:]?\s*(?P<title>.+?)(?:[.?!](?:\s|$)|$)"
+)
+_DOI_SCAFFOLD_RE = re.compile(r"https?://(?:dx\.)?doi\.org/|\bdoi\s*:?", re.IGNORECASE)
 
 
 @dataclass
@@ -74,6 +90,11 @@ class Work:
     year: int | None
     doi: str | None
     source: str
+    other_years: tuple[int, ...] = ()  # e.g. print vs online publication year
+
+    @property
+    def years(self) -> set[int]:
+        return ({self.year} if self.year else set()) | set(self.other_years)
 
 
 # --------------------------------------------------------------------------- extraction
@@ -119,7 +140,19 @@ def extract_references(text: str, bib_entries: list[Reference] | None = None) ->
 
 
 def _find_dois(text: str) -> list[str]:
-    return [m.group(0).rstrip(".,;:") for m in _DOI_RE.finditer(text)]
+    return [doi for m in _DOI_RE.finditer(text) if (doi := _clean_doi(m.group(0)))]
+
+
+def _clean_doi(raw: str) -> str:
+    """Remove Markdown and punctuation around a DOI; keep balanced parentheses."""
+    doi = raw.split("](", 1)[0]  # [text](url) links
+    while doi:
+        last = doi[-1]
+        if last in ".,;:*_]}>" or (last == ")" and doi.count("(") < doi.count(")")):
+            doi = doi[:-1]
+        else:
+            break
+    return doi
 
 
 def _reference_from_text(line: int, entry: str, *, compare: bool) -> Reference:
@@ -211,20 +244,55 @@ def title_score(entry_text: str, title: str) -> float:
     return sum(1 for w in words if w in present) / len(words)
 
 
-def compare_work(entry_text: str, work: Work, *, score: float | None = None) -> list[str]:
-    """Return a list of problems (empty means the metadata are consistent)."""
+def entry_title(entry_text: str) -> str | None:
+    """The title of an APA-like entry ("Author (Year). Title. ..."), if it can be isolated."""
+    match = _TITLE_AFTER_YEAR_RE.search(entry_text)
+    if not match:
+        return None
+    title = match.group("title").strip()
+    return title if len(_tokens(title)) >= 2 else None
+
+
+def titles_agree(entry_title_text: str, work_title: str) -> bool:
+    """Symmetric comparison, so a one-word title ("Introduction") cannot match a long one.
+
+    A shortened title (the main title without its subtitle) is accepted when it has at
+    least three words and covers at least half of the full title.
+    """
+    found, cited = set(_tokens(work_title)), set(_tokens(entry_title_text))
+    if not found or not cited:
+        return False
+    overlap = len(found & cited)
+    if overlap / max(len(found), len(cited)) >= 0.75:
+        return True
+    return cited <= found and len(cited) >= 3 and len(cited) / len(found) >= 0.5
+
+
+def compare_work(entry_text: str, work: Work, *, require_title: bool = True) -> list[str]:
+    """Return the disagreements between an entry and a work (empty: everything agrees).
+
+    Author, year and title must all agree. With *require_title* False (the entry gives a
+    DOI, which already identifies the work) a missing title is accepted, a different one is not.
+    """
     problems: list[str] = []
     years = {int(y) for y in _YEAR_RE.findall(entry_text)}
-    if work.year and years and work.year not in years:
-        problems.append(f"year is {work.year}, the entry says {', '.join(map(str, sorted(years)))}")
-    title_ok = (score if score is not None else title_score(entry_text, work.title)) >= 0.6
+    if work.years and years and not (work.years & years):
+        shown = ", ".join(map(str, sorted(work.years)))
+        problems.append(f"year is {shown}, the entry says {', '.join(map(str, sorted(years)))}")
     # Whole-word match: an author called "Li" must not be "found" inside "Linear".
     surname = _norm(work.first_author).strip()
-    author_ok = bool(surname) and (
-        re.search(rf"(?<![a-z0-9]){re.escape(surname)}(?![a-z0-9])", _norm(entry_text)) is not None
-    )
-    if work.first_author and not author_ok and not title_ok:
+    if surname and not re.search(
+        rf"(?<![a-z0-9]){re.escape(surname)}(?![a-z0-9])", _norm(entry_text)
+    ):
         problems.append(f"first author is '{work.first_author}', not found in the entry")
+    cited_title = entry_title(entry_text)
+    if cited_title is not None:
+        if not titles_agree(cited_title, work.title):
+            problems.append(f"the title is different: '{work.title}'")
+    elif require_title and (
+        len(_tokens(work.title)) < 3 or title_score(entry_text, work.title) < TITLE_MATCH
+    ):
+        problems.append(f"could not match the title '{work.title}' in the entry")
     return problems
 
 
@@ -269,98 +337,185 @@ class Lookup:
             params["mailto"] = self.mailto
         key = hashlib.sha256(json.dumps([url, sorted(params.items())]).encode()).hexdigest()
         path = self.cache_dir / f"{key}.json"
-        if path.exists():
-            try:
-                cached = json.loads(path.read_text(encoding="utf-8"))
-                return Fetch(cached["status"], cached.get("data"))
-            except (OSError, ValueError, KeyError):
-                pass  # corrupt cache entry: fetch again
+        cached = self._load(path)
+        if cached is not None:
+            return cached
         if self.offline:
             return Fetch("uncached")
         if self.delay:
             time.sleep(self.delay)
         try:
             response = self._client.get(url, params=params)
-        except httpx.HTTPError:
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, UnicodeError):
             return Fetch("error")
         if response.status_code == 404:
             fetch = Fetch("notfound")
         elif response.status_code == 200:
             try:
-                fetch = Fetch("ok", response.json())
+                data = response.json()
             except ValueError:
                 return Fetch("error")
+            if not isinstance(data, dict):
+                return Fetch("error")  # not what these APIs return: treat as an outage
+            fetch = Fetch("ok", data)
         else:
             return Fetch("error")  # rate limits and server errors are not cached
         self._store(path, fetch)
         return fetch
 
+    def _load(self, path: Path) -> Fetch | None:
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            fetch = Fetch(cached["status"], cached.get("data"))
+            saved = float(cached.get("time", 0))
+        except (OSError, ValueError, KeyError, TypeError):
+            return None  # missing or corrupt cache entry: fetch again
+        if fetch.status == "notfound" and time.time() - saved > NOT_FOUND_TTL:
+            return None  # a DOI may have been registered since
+        return fetch
+
     def _store(self, path: Path, fetch: Fetch) -> None:
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"status": fetch.status, "data": fetch.data}), "utf-8")
+            payload = {"status": fetch.status, "data": fetch.data, "time": time.time()}
+            path.write_text(json.dumps(payload), "utf-8")
         except OSError:
             pass  # the cache is an optimisation only
 
 
-def _crossref_work(item: dict[str, Any]) -> Work:
+def _first_year(parts: Any) -> int | None:
+    try:
+        year = parts["date-parts"][0][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return year if isinstance(year, int) else None
+
+
+def _crossref_work(item: Any) -> Work | None:
+    if not isinstance(item, dict):
+        return None
     titles = item.get("title") or [""]
     authors = item.get("author") or [{}]
-    issued = (item.get("issued") or {}).get("date-parts") or [[None]]
-    year = issued[0][0] if issued and issued[0] else None
+    first = authors[0] if isinstance(authors, list) and authors else {}
+    years = [_first_year(item.get(k)) for k in ("issued", "published-print", "published-online")]
+    found = [y for y in years if y]
     return Work(
-        title=titles[0] if titles else "",
-        first_author=str(authors[0].get("family", "")) if authors else "",
-        year=year if isinstance(year, int) else None,
+        title=str(titles[0]) if isinstance(titles, list) and titles else "",
+        first_author=str(first.get("family", "")) if isinstance(first, dict) else "",
+        year=found[0] if found else None,
         doi=item.get("DOI"),
         source="Crossref",
+        other_years=tuple(found[1:]),
     )
 
 
-def _openalex_work(item: dict[str, Any]) -> Work:
+def _openalex_work(item: Any) -> Work | None:
+    if not isinstance(item, dict):
+        return None
     authorships = item.get("authorships") or []
-    name = (authorships[0].get("author") or {}).get("display_name", "") if authorships else ""
-    doi = item.get("doi") or ""
+    first = authorships[0] if isinstance(authorships, list) and authorships else {}
+    author = first.get("author") if isinstance(first, dict) else None
+    name = str(author.get("display_name") or "") if isinstance(author, dict) else ""
+    doi = str(item.get("doi") or "")
+    year = item.get("publication_year")
     return Work(
-        title=item.get("display_name") or item.get("title") or "",
-        first_author=name.split()[-1] if name else "",
-        year=item.get("publication_year")
-        if isinstance(item.get("publication_year"), int)
-        else None,
+        title=str(item.get("display_name") or item.get("title") or ""),
+        first_author=name.split()[-1] if name.split() else "",
+        year=year if isinstance(year, int) else None,
         doi=doi.removeprefix("https://doi.org/") or None,
         source="OpenAlex",
     )
 
 
+def _datacite_work(payload: Any) -> Work | None:
+    attributes = payload.get("data", {}).get("attributes") if isinstance(payload, dict) else None
+    if not isinstance(attributes, dict):
+        return None
+    titles = attributes.get("titles") or [{}]
+    creators = attributes.get("creators") or [{}]
+    first = creators[0] if isinstance(creators, list) and creators else {}
+    family = ""
+    if isinstance(first, dict):
+        family = str(first.get("familyName") or str(first.get("name") or "").split(",")[0])
+    year = attributes.get("publicationYear")
+    title = (
+        titles[0].get("title", "")
+        if isinstance(titles, list) and isinstance(titles[0], dict)
+        else ""
+    )
+    return Work(
+        title=str(title),
+        first_author=family.strip(),
+        year=int(str(year)) if str(year).isdigit() else None,
+        doi=attributes.get("doi"),
+        source="DataCite",
+    )
+
+
+def _crossref_message(payload: Any) -> Work | None:
+    return _crossref_work(payload.get("message")) if isinstance(payload, dict) else None
+
+
 def fetch_by_doi(lookup: Lookup, doi: str) -> tuple[Work | None, bool]:
-    """Return (work, definitive). *definitive* is True only if every source said "not found"."""
-    crossref = lookup.get(f"{CROSSREF}/{doi}")
-    if crossref.status == "ok":
-        return _crossref_work(crossref.data.get("message", {})), True
-    openalex = lookup.get(f"{OPENALEX}/https://doi.org/{doi}")
-    if openalex.status == "ok":
-        return _openalex_work(openalex.data), True
-    return None, crossref.status == "notfound" and openalex.status == "notfound"
+    """Return (work, definitive). *definitive* is True only if every source said "not found".
+
+    Crossref holds most journal DOIs, OpenAlex adds many others, and DataCite holds arXiv,
+    Zenodo and other repository DOIs.
+    """
+    statuses = []
+    sources: list[tuple[str, Callable[[Any], Work | None]]] = [
+        (f"{CROSSREF}/{doi}", _crossref_message),
+        (f"{OPENALEX}/https://doi.org/{doi}", _openalex_work),
+        (f"{DATACITE}/{doi}", _datacite_work),
+    ]
+    for url, parse in sources:
+        fetch = lookup.get(url)
+        if fetch.status == "ok":
+            work = parse(fetch.data)
+            if work is not None:
+                return work, True
+            fetch = Fetch("error")  # unexpected shape: treat as an outage
+        statuses.append(fetch.status)
+    return None, all(s == "notfound" for s in statuses)
 
 
-def search_by_text(lookup: Lookup, text: str) -> tuple[list[Work], bool]:
+def search_by_text(lookup: Lookup, text: str) -> tuple[list[Work], bool, bool]:
+    """Search both catalogues. Returns (works, any source answered, every source answered)."""
     works: list[Work] = []
-    reached = False
+    answered = []
     crossref = lookup.get(
         CROSSREF,
-        {"query.bibliographic": text[:300], "rows": "5", "select": "DOI,title,author,issued"},
+        {
+            "query.bibliographic": text[:300],
+            "rows": "5",
+            "select": "DOI,title,author,issued,published-print,published-online",
+        },
     )
-    if crossref.status == "ok":
-        reached = True
-        works += [_crossref_work(i) for i in crossref.data.get("message", {}).get("items", [])]
+    items = crossref.data.get("message", {}).get("items") if crossref.status == "ok" else None
+    answered.append(isinstance(items, list))
+    if isinstance(items, list):
+        works += [w for i in items if (w := _crossref_work(i))]
     openalex = lookup.get(OPENALEX, {"search": text[:300], "per-page": "5"})
-    if openalex.status == "ok":
-        reached = True
-        works += [_openalex_work(i) for i in openalex.data.get("results", [])]
-    return works, reached
+    results = openalex.data.get("results") if openalex.status == "ok" else None
+    answered.append(isinstance(results, list))
+    if isinstance(results, list):
+        works += [w for i in results if (w := _openalex_work(i))]
+    return works, any(answered), all(answered)
 
 
 # --------------------------------------------------------------------------- verification
+
+
+def _valid_doi(doi: str) -> bool:
+    return len(doi) <= MAX_DOI_LENGTH and _VALID_DOI_RE.match(doi) is not None
+
+
+def normalize_doi(raw: str) -> str:
+    """Accept DOIs as written in BibTeX or by hand: with a doi.org URL, a 'doi:' prefix,
+    surrounding Markdown or trailing punctuation."""
+    doi = raw.strip().strip("`*_<>\"'")
+    doi = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi\s*:\s*)", "", doi, flags=re.IGNORECASE)
+    return _clean_doi(doi.strip())
 
 
 def verify(path: str, ref: Reference, lookup: Lookup) -> CitationResult:
@@ -368,41 +523,52 @@ def verify(path: str, ref: Reference, lookup: Lookup) -> CitationResult:
     shown = ref.text if len(ref.text) <= 140 else ref.text[:137] + "..."
 
     def result(status: CitationStatus, message: str) -> CitationResult:
-        return CitationResult(path, ref.line, shown, status, message, ref.identifier)
+        return CitationResult(path, ref.line, shown, status, message, ref.identifier[:200])
 
-    doi = ref.doi or (f"10.48550/arXiv.{ref.arxiv}" if ref.arxiv else None)
-    if doi:
-        work, reached = fetch_by_doi(lookup, doi)
+    doi = normalize_doi(ref.doi) if ref.doi else None
+    if doi is None and ref.arxiv:
+        doi = f"10.48550/arXiv.{ref.arxiv}"
+    if doi is not None:
+        if not _valid_doi(doi):
+            return result(CitationStatus.UNPARSEABLE, "not a valid DOI")
+        work, definitive = fetch_by_doi(lookup, doi)
         if work is None:
-            if reached:
-                return result(CitationStatus.NOT_FOUND, f"{doi} not found in Crossref or OpenAlex")
+            if definitive:
+                return result(
+                    CitationStatus.NOT_FOUND, f"{doi} not found in Crossref, OpenAlex or DataCite"
+                )
             return result(CitationStatus.UNCHECKED, _unchecked_reason(lookup))
         if not ref.compare:
             return result(
                 CitationStatus.VERIFIED, f"exists: {_describe(work)} (metadata not compared)"
             )
-        entry = ref.text.replace(doi, " ")
+        entry = _DOI_SCAFFOLD_RE.sub(" ", ref.text.replace(ref.doi or doi, " ").replace(doi, " "))
         if len(_tokens(entry)) < 2:
             return result(CitationStatus.VERIFIED, f"exists: {_describe(work)}")
-        problems = compare_work(entry, work)
+        problems = compare_work(entry, work, require_title=False)
         if problems:
             return result(CitationStatus.MISMATCH, "; ".join(problems) + f" -> {_describe(work)}")
         return result(CitationStatus.VERIFIED, f"matches {_describe(work)}")
 
     if len(_tokens(ref.text)) < 3:
         return result(CitationStatus.UNPARSEABLE, "too little text to identify a work")
-    works, reached = search_by_text(lookup, ref.text)
-    if not reached:
+    works, any_answer, all_answered = search_by_text(lookup, ref.text)
+    if not any_answer:
         return result(CitationStatus.UNCHECKED, _unchecked_reason(lookup))
     scored = sorted(((title_score(ref.text, w.title), w) for w in works), key=lambda t: -t[0])
-    if not scored or scored[0][0] < TITLE_CLOSE:
-        return result(CitationStatus.NOT_FOUND, "no work with a matching title found")
-    score, best = scored[0]
-    if score < TITLE_MATCH:
+    best_score, best = scored[0] if scored else (0.0, None)
+    if best is None or best_score < TITLE_MATCH:
+        if not all_answered:
+            return result(
+                CitationStatus.UNCHECKED,
+                "only some catalogues answered and none had a matching title; not checked",
+            )
+        if best is None or best_score < TITLE_CLOSE:
+            return result(CitationStatus.NOT_FOUND, "no work with a matching title found")
         return result(
             CitationStatus.MISMATCH, f"closest work has a different title -> {_describe(best)}"
         )
-    problems = compare_work(ref.text, best, score=score)
+    problems = compare_work(ref.text, best)
     if problems:
         return result(CitationStatus.MISMATCH, "; ".join(problems) + f" -> {_describe(best)}")
     return result(CitationStatus.VERIFIED, f"matches {_describe(best)}")
@@ -418,4 +584,4 @@ def _describe(work: Work) -> str:
 def _unchecked_reason(lookup: Lookup) -> str:
     if lookup.offline:
         return "offline mode and not in cache"
-    return "could not reach Crossref/OpenAlex (network error or rate limit); not checked"
+    return "could not reach the catalogues (network error or rate limit); not checked"

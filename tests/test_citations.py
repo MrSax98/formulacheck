@@ -96,7 +96,10 @@ def test_too_short_entry_is_unparseable(tmp_path: Path) -> None:
 
 def test_network_failure_is_unchecked_never_not_found(tmp_path: Path) -> None:
     api = FakeApi(fail=True)
-    for r in (ref("x (2000). Some title here", "10.1/abc"), ref("Efron (1979). Bootstrap methods")):
+    for r in (
+        ref("x (2000). Some title here", "10.1234/abc"),
+        ref("Efron (1979). Bootstrap methods"),
+    ):
         assert verify("f.md", r, lookup(tmp_path, api)).status is CitationStatus.UNCHECKED
 
 
@@ -118,7 +121,7 @@ def test_cache_avoids_repeated_requests_and_offline_uses_it(tmp_path: Path) -> N
 
 def test_offline_without_cache_is_unchecked(tmp_path: Path) -> None:
     offline = Lookup(tmp_path / "empty", offline=True, transport=httpx.MockTransport(FakeApi()))
-    assert verify("f.md", ref("x", "10.1/abc"), offline).status is CitationStatus.UNCHECKED
+    assert verify("f.md", ref("x", "10.1234/abc"), offline).status is CitationStatus.UNCHECKED
 
 
 def test_mailto_is_sent_only_when_configured(tmp_path: Path) -> None:

@@ -142,7 +142,9 @@ def test_author_must_match_as_a_whole_word() -> None:
     """A real DOI by 'Li' cited as someone else's 'Linear models' paper is a mismatch."""
     from formulacheck.citations import Work, compare_work
 
-    work = Work("Deep residual graphs", "Li", 2000, "10.1/x", "Crossref")
+    work = Work("Linear models for data", "Li", 2000, "10.1/x", "Crossref")
+    # "Li" inside "Linear" does not count as the author
     assert compare_work("Smith, J. (2000). Linear models for data.", work)
     assert not compare_work("Li, W. (2000). Linear models for data.", work)
-    assert not compare_work("Smith (2000). Deep residual graphs.", work)  # title matches
+    # author, year and title must all agree (review finding: author was ignored)
+    assert compare_work("Li, W. (2000). Deep residual graphs.", work)

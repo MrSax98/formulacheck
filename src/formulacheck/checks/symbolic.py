@@ -34,6 +34,24 @@ _KNOWN_ASSUMPTIONS = {
 }
 
 
+PRECISION = 30  # digits used for numerical evaluation
+DEFAULT_RTOL = 1e-9
+DEFAULT_ATOL = 1e-25  # only absorbs rounding at 30 digits; tiny true values still differ
+
+
+def _sym_number(value: int | float) -> sympy.Basic:
+    """Literals are exact in symbolic checks: 1/2 is one half, 0.3 is 3/10."""
+    if isinstance(value, int):
+        return sympy.Integer(value)
+    return sympy.Rational(repr(value))
+
+
+def _limit(f: Any, v: Any, point: Any, direction: str = "+-") -> Any:
+    if point in (sympy.oo, -sympy.oo):
+        return sympy.limit(f, v, point)  # one direction only exists at infinity
+    return sympy.limit(f, v, point, dir=direction)
+
+
 def _sum(f: Any, v: Any, lo: Any, hi: Any) -> Any:
     return sympy.Sum(f, (v, lo, hi)).doit()
 
@@ -86,7 +104,9 @@ SYMBOLIC_FUNCS: dict[str, Callable[..., Any]] = {
     "Product": _product,
     "Integral": _integral,
     "Derivative": lambda f, v: sympy.diff(f, v),
-    "Limit": lambda f, v, p: sympy.limit(f, v, p),
+    "Limit": lambda f, v, p: _limit(f, v, p, "+-"),
+    "LimitRight": lambda f, v, p: _limit(f, v, p, "+"),
+    "LimitLeft": lambda f, v, p: _limit(f, v, p, "-"),
 }
 
 
@@ -152,9 +172,18 @@ def _to_sympy(value: Any) -> sympy.Basic:
 
 def _eval_sym(source: str, env: Mapping[str, Any]) -> sympy.Basic:
     try:
-        return _to_sympy(evaluate(parse(source), env, SYMBOLIC_FUNCS))
+        return _to_sympy(evaluate(parse(source), env, SYMBOLIC_FUNCS, number=_sym_number))
     except (sympy.SympifyError, NotImplementedError, RecursionError) as exc:
         raise ExprError(f"sympy could not evaluate '{source}': {exc}") from exc
+
+
+def _undefined(expr: sympy.Basic) -> bool:
+    """nan, complex infinity or an interval of values (e.g. the 'limit' of sin at infinity)."""
+    return bool(expr.has(sympy.nan, sympy.zoo) or expr.has(sympy.AccumBounds))
+
+
+def _infinite(expr: sympy.Basic) -> bool:
+    return expr in (sympy.oo, -sympy.oo) or expr.is_infinite is True
 
 
 def _sample_value(rng: random.Random, flags: set[str]) -> sympy.Basic:
@@ -166,22 +195,26 @@ def _sample_value(rng: random.Random, flags: set[str]) -> sympy.Basic:
             return sympy.Integer(rng.randint(0, 8))
         if "negative" in flags:
             return sympy.Integer(rng.randint(-8, -1))
+        if "nonpositive" in flags:
+            return sympy.Integer(rng.randint(-8, 0))
         return sympy.Integer(rng.randint(-5, 5))
     if positive:
-        return sympy.Float(rng.uniform(0.5, 3.0))
-    if "nonnegative" in flags:
-        return sympy.Float(rng.uniform(0.0, 3.0))
-    if "negative" in flags:
-        return sympy.Float(rng.uniform(-3.0, -0.5))
-    if "nonpositive" in flags:
-        return sympy.Float(rng.uniform(-3.0, 0.0))
-    return sympy.Float(rng.uniform(-3.0, 3.0))
+        low, high = 0.5, 3.0
+    elif "nonnegative" in flags:
+        low, high = 0.0, 3.0
+    elif "negative" in flags:
+        low, high = -3.0, -0.5
+    elif "nonpositive" in flags:
+        low, high = -3.0, 0.0
+    else:
+        low, high = -3.0, 3.0
+    return sympy.Float(rng.uniform(low, high), PRECISION)
 
 
 def _numeric_value(expr: sympy.Basic, point: Mapping[sympy.Symbol, Any]) -> complex | None:
     """Evaluate *expr* at *point*; None if undefined there (pole, branch, overflow)."""
     try:
-        value = sympy.N(expr.subs(point).doit(), 15)
+        value = sympy.N(expr.subs(point).doit(), PRECISION)
         result = complex(value)
     except (TypeError, ValueError, ZeroDivisionError, OverflowError, AttributeError):
         return None
@@ -211,12 +244,13 @@ def run_symbolic(spec: dict[str, Any]) -> Outcome:
     require_keys(
         spec,
         {"id", "kind", "lhs", "rhs"},
-        {"claim", "symbols", "assume", "timeout", "rtol", "seed"},
+        {"claim", "symbols", "assume", "timeout", "rtol", "atol", "seed"},
     )
     symbols, flags = build_symbols(spec)
     env: dict[str, Any] = {**CONSTANTS, **symbols}
     lhs_src, rhs_src = get_str(spec, "lhs"), get_str(spec, "rhs")
-    rtol = get_number(spec, "rtol", 1e-9, 0, 1)
+    rtol = get_number(spec, "rtol", DEFAULT_RTOL, 0, 1)
+    atol = get_number(spec, "atol", DEFAULT_ATOL, 0, 1)
     seed = int(get_number(spec, "seed", 0, 0, 2**31))
     timeout = get_timeout(spec)
 
@@ -228,6 +262,13 @@ def run_symbolic(spec: dict[str, Any]) -> Outcome:
             # inside the time limit.
             lhs = _eval_sym(lhs_src, env)
             rhs = _eval_sym(rhs_src, env)
+            for name, side in (("lhs", lhs), ("rhs", rhs)):
+                if _undefined(side):
+                    return Outcome(Status.ERROR, f"{name} is undefined: {side}")
+            if _infinite(lhs) or _infinite(rhs):
+                if lhs == rhs:
+                    return Outcome(Status.PASS, f"both sides are {lhs}")
+                return Outcome(Status.FAIL, f"lhs = {lhs}, rhs = {rhs}")
             free = sorted((lhs.free_symbols | rhs.free_symbols), key=str)
             for _ in range(60):
                 if valid >= 8:
@@ -237,7 +278,7 @@ def run_symbolic(spec: dict[str, Any]) -> Outcome:
                 if a is None or b is None:
                     continue
                 valid += 1
-                if not _close(a, b, rtol, 1e-12):
+                if not _close(a, b, rtol, atol):
                     return Outcome(
                         Status.FAIL,
                         f"lhs != rhs at {_fmt_point(point)}: lhs={_fmt(a)}, rhs={_fmt(b)}",
@@ -265,6 +306,15 @@ def _prove(lhs: sympy.Basic, rhs: sympy.Basic, valid: int) -> Outcome:
         verdict = None
     if verdict is True:
         return Outcome(Status.PASS, "proved: sympy equals() is True", {"method": "equals"})
+    if verdict is False and valid == 0:
+        # No point could be evaluated numerically, so sympy's verdict is the only evidence.
+        return Outcome(Status.FAIL, "sympy shows that lhs and rhs differ")
+    if verdict is False:
+        return Outcome(
+            Status.INCONCLUSIVE,
+            f"sympy says lhs and rhs differ, but they agree at {valid} random points",
+            {"points": valid},
+        )
     if valid < 3:
         return Outcome(
             Status.INCONCLUSIVE,
@@ -285,8 +335,8 @@ def run_numeric(spec: dict[str, Any]) -> Outcome:
         raise SpecError("'points' must be a non-empty list of mappings name -> value")
     if len(points) > 1000:
         raise SpecError("at most 1000 points are allowed")
-    rtol = get_number(spec, "rtol", 1e-9, 0, 1)
-    atol = get_number(spec, "atol", 1e-12, 0, 1)
+    rtol = get_number(spec, "rtol", DEFAULT_RTOL, 0, 1)
+    atol = get_number(spec, "atol", DEFAULT_ATOL, 0, 1)
     lhs_src, rhs_src = get_str(spec, "lhs"), get_str(spec, "rhs")
     timeout = get_timeout(spec)
 
@@ -322,7 +372,7 @@ def _point_env(raw_point: Any) -> dict[str, Any]:
         elif isinstance(value, bool) or not isinstance(value, int | float):
             raise SpecError(f"value of '{name}' must be a number or a constant expression")
         elif isinstance(value, float):
-            env[name] = sympy.Float(value, 30)
+            env[name] = sympy.Float(value, PRECISION)
         else:
             env[name] = sympy.Integer(value)
     return env
@@ -330,7 +380,7 @@ def _point_env(raw_point: Any) -> dict[str, Any]:
 
 def _complex(value: sympy.Basic) -> complex:
     try:
-        result = complex(sympy.N(value.doit(), 15))
+        result = complex(sympy.N(value.doit(), PRECISION))
     except (TypeError, ValueError) as exc:
         raise ExprError("expression is not a finite number at this point") from exc
     if result != result or abs(result) == float("inf"):
