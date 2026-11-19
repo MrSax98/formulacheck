@@ -1,0 +1,8 @@
+- id: formulacheck
+  name: formulacheck
+  description: Verify formulas (check blocks) and citations in Markdown notes.
+  entry: formulacheck
+  language: python
+  types: [markdown]
+  args: [--offline]
+  require_serial: true

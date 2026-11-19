@@ -1,0 +1,90 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "formulacheck"
+version = "0.1.0"
+description = "Verify the math in your notes: a linter that checks formulas (symbolic, numeric, Monte Carlo) and citations in Markdown/LaTeX study notes, including notes written with LLMs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = [
+    "math", "latex", "markdown", "notes", "study", "students", "statistics", "probability",
+    "monte-carlo", "sympy", "linter", "verification", "citations", "crossref", "llm",
+    "hallucination", "obsidian",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Education",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Text Processing :: Markup :: Markdown",
+    "Topic :: Text Processing :: Markup :: LaTeX",
+]
+dependencies = [
+    "sympy>=1.12",
+    "numpy>=1.26",
+    "PyYAML>=6.0",
+    "httpx>=0.27",
+    "jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "types-PyYAML",
+]
+
+[project.urls]
+Homepage = "https://github.com/MrSax98/formulacheck"
+Documentation = "https://github.com/MrSax98/formulacheck/blob/main/docs/block-syntax.md"
+Issues = "https://github.com/MrSax98/formulacheck/issues"
+Changelog = "https://github.com/MrSax98/formulacheck/blob/main/CHANGELOG.md"
+
+[project.scripts]
+formulacheck = "formulacheck.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+formulacheck = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+plugins = []
+
+[[tool.mypy.overrides]]
+module = ["sympy.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[tool.ruff.lint.per-file-ignores]
+"src/formulacheck/report.py" = ["E501"]  # HTML template
+"tests/*" = ["E501"]
