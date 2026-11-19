@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import signal
+import sys
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -39,8 +40,15 @@ MAX_TIMEOUT = 120.0
 
 @contextlib.contextmanager
 def time_limit(seconds: float) -> Iterator[None]:
-    """Raise :class:`CheckTimeout` after *seconds* (Unix main thread only; no-op elsewhere)."""
-    if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+    """Raise :class:`CheckTimeout` after *seconds* (Unix main thread only; no-op elsewhere).
+
+    Windows has no SIGALRM; there the runner uses a killable worker process instead
+    (see ``checks/isolate.py``).
+    """
+    if sys.platform == "win32":  # written this way so mypy skips the Unix-only code below
+        yield
+        return
+    if threading.current_thread() is not threading.main_thread():
         yield
         return
 
